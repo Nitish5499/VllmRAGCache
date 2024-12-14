@@ -61,6 +61,9 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter, Device, deprecate_kwargs, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.rag.vector_db import RAGProcessor, VectorDBConnector
+from vllm.model_executor.model_loader import DocumentKVCache
+from vllm.rag.knowledge_tree import KnowledgeTree
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -229,6 +232,7 @@ class LLMEngine:
         input_registry: InputRegistry = INPUT_REGISTRY,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
+        rag_processor: Optional[RAGProcessor] = None,
     ) -> None:
 
         self.vllm_config = vllm_config
@@ -245,6 +249,7 @@ class LLMEngine:
         self.prompt_adapter_config = vllm_config.prompt_adapter_config  # noqa
         self.observability_config = vllm_config.observability_config or ObservabilityConfig(  # noqa
         )
+        self.rag_processor = rag_processor
 
         logger.info(
             "Initializing an LLM engine (v%s) with config: %s, "
@@ -688,6 +693,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        use_rag: bool = False,
     ) -> None:
         ...
 
@@ -704,6 +710,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        use_rag: bool = False,
     ) -> None:
         ...
 
@@ -721,6 +728,7 @@ class LLMEngine:
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
+            use_rag: bool = False,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
@@ -742,6 +750,7 @@ class LLMEngine:
             trace_headers: OpenTelemetry trace headers.
             priority: The priority of the request.
                 Only applicable with priority scheduling.
+            use_rag: Whether to use Retrieval Augmented Generation (RAG).
 
         Details:
             - Set arrival_time to the current time if it is None.
@@ -801,6 +810,10 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
+
+        if use_rag and self.rag_processor and isinstance(prompt, str):
+            # Augment prompt with retrieved context
+            prompt = self.rag_processor.augment_prompt(prompt)
 
         self._add_processed_request(
             request_id=request_id,
@@ -1052,6 +1065,7 @@ class LLMEngine:
             # [sequence group][step].
             outputs_by_sequence_group = create_output_by_sequence_group(
                 outputs, num_seq_groups=len(seq_group_metadata_list))
+            )
             # We have outputs for multiple steps submitted in a single burst,
             # so invalidate is_first_step_output.
             is_first_step_output = None
@@ -2044,3 +2058,59 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+    def _add_request_with_cached_kv(
+        self,
+        request_id: str,
+        prompt: str,
+        cached_kvs: List[DocumentKVCache],
+        sampling_params: Optional[SamplingParams] = None,
+    ) -> None:
+        """Add a request that reuses cached KV tensors from previous document context."""
+        
+        # Create sequence
+        seq = self._create_sequence(request_id, prompt, sampling_params)
+        
+        # Get the block table from the sequence
+        block_table = seq.get_block_table()
+        
+        # For each cached document KV
+        for doc_cache in cached_kvs:
+            # Get the physical block size from the cache config
+            block_size = self.cache_config.block_size
+            
+            # Calculate number of blocks needed for this document
+            num_tokens = len(doc_cache.token_ids)
+            num_blocks = (num_tokens + block_size - 1) // block_size
+            
+            # Allocate blocks for the cached KV tensors
+            for block_idx in range(num_blocks):
+                start_idx = block_idx * block_size
+                end_idx = min(start_idx + block_size, num_tokens)
+                
+                # Create a new physical block
+                physical_block = self.scheduler[0].block_manager.allocate(
+                    block_size=block_size,
+                    dtype=doc_cache.kv_cache.dtype,
+                    device=doc_cache.kv_cache.device
+                )
+                
+                # Copy the cached KV tensor to the physical block
+                with torch.cuda.stream(self.scheduler[0].block_manager.copy_stream):
+                    block_start = start_idx * block_size
+                    block_end = end_idx * block_size
+                    physical_block.copy_(doc_cache.kv_cache[block_start:block_end])
+                
+                # Map logical block to physical block
+                block_table.add_physical_block(physical_block)
+        
+        # Create sequence group
+        seq_group = self._create_sequence_group(
+            request_id=request_id,
+            seq=seq,
+            sampling_params=sampling_params,
+            arrival_time=time.time()
+        )
+        
+        # Add to scheduler
+        self.scheduler[0].add_seq_group(seq_group)
